@@ -1,0 +1,197 @@
+﻿<input type="text" id="username" placeholder="اسم المستخدم" />
+<input type="text" id="roomName" placeholder="اسم الغرفة" />
+<button id="joinBtn">انضم</button>
+
+<h3>المستخدمون في الغرفة</h3>
+<ul id="usersList"></ul>
+
+<div id="callControls" style="margin-top:10px;">
+    <button id="startCallBtn" disabled>بدء الاتصال الصوتي</button>
+    <button id="endCallBtn" disabled>إنهاء الاتصال</button>
+</div>
+
+<audio id="remoteAudio" autoplay></audio>
+<div id="callStatus"></div>
+<div id="callDuration"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/7.0.7/signalr.min.js"></script>
+<script>
+    let connection = null;
+    let myConnectionId = null;
+    let currentUser = null;
+    let currentRoom = null;
+    let targetConnectionId = null;
+    let callId = null;
+
+    let peerConnection = null;
+    let localStream = null;
+
+    let timerInterval = null;
+    let startTime = null;
+
+    const rtcConfig = {
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    };
+
+    const startCallBtn = document.getElementById("startCallBtn");
+    const endCallBtn = document.getElementById("endCallBtn");
+    const usersList = document.getElementById("usersList");
+    const callStatus = document.getElementById("callStatus");
+    const callDuration = document.getElementById("callDuration");
+
+    document.getElementById("joinBtn").addEventListener("click", async () => {
+        currentUser = document.getElementById("username").value.trim();
+        currentRoom = document.getElementById("roomName").value.trim();
+
+        if (!currentUser || !currentRoom) {
+            alert("يرجى إدخال اسم المستخدم واسم الغرفة");
+            return;
+        }
+
+        connection = new signalR.HubConnectionBuilder()
+            .withUrl("/chatHub")
+            .build();
+
+        connection.on("UserList", users => {
+            usersList.innerHTML = "";
+            users.forEach(u => {
+                if (u.connectionId !== myConnectionId) {
+                    const li = document.createElement("li");
+                    li.textContent = u.username || "مستخدم غير معرف";
+                    li.dataset.id = u.connectionId;
+                    li.onclick = () => {
+                        targetConnectionId = u.connectionId;
+                        startCallBtn.disabled = false;
+                        callStatus.textContent = `تم اختيار ${u.username || "غير معروف"} للاتصال`;
+                    };
+                    usersList.appendChild(li);
+                }
+            });
+        });
+
+        connection.on("UserJoined", (connId, username) => {
+            callStatus.textContent = `${username} انضم للغرفة`;
+        });
+
+        connection.on("UserLeft", () => {
+            callStatus.textContent = `أحد المستخدمين خرج من الغرفة`;
+        });
+
+        connection.on("ReceiveSignal", async (fromId, type, data) => {
+            if (!peerConnection) createPeerConnection(fromId);
+
+            switch (type) {
+                case "offer":
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+                    const answer = await peerConnection.createAnswer();
+                    await peerConnection.setLocalDescription(answer);
+                    await connection.invoke("SendSignal", fromId, "answer", answer);
+                    startTimer();
+                    startCallBtn.disabled = true;
+                    endCallBtn.disabled = false;
+                    break;
+
+                case "answer":
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+                    startTimer();
+                    startCallBtn.disabled = true;
+                    endCallBtn.disabled = false;
+                    break;
+
+                case "ice":
+                    if (data) {
+                        try {
+                            await peerConnection.addIceCandidate(new RTCIceCandidate(data));
+                        } catch (e) {
+                            console.error(e);
+                        }
+                    }
+                    break;
+            }
+        });
+
+        await connection.start();
+        myConnectionId = connection.connectionId;
+
+        await connection.invoke("JoinRoom", currentUser, currentRoom);
+        callStatus.textContent = `تم الانضمام إلى الغرفة: ${currentRoom}`;
+    });
+
+    startCallBtn.addEventListener("click", async () => {
+        if (!targetConnectionId) return;
+
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        createPeerConnection(targetConnectionId);
+
+        localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+        });
+
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        await connection.invoke("SendSignal", targetConnectionId, "offer", offer);
+
+        callId = await connection.invoke("StartCallLog", targetConnectionId);
+
+        startTimer();
+        startCallBtn.disabled = true;
+        endCallBtn.disabled = false;
+    });
+
+    endCallBtn.addEventListener("click", async () => {
+        stopTimer();
+
+        if (peerConnection) peerConnection.close();
+        if (localStream) localStream.getTracks().forEach(t => t.stop());
+
+        peerConnection = null;
+        localStream = null;
+        targetConnectionId = null;
+
+        startCallBtn.disabled = true;
+        endCallBtn.disabled = true;
+        callStatus.textContent = "تم إنهاء الاتصال";
+
+        if (callId !== null) {
+            await connection.invoke("EndCallLog", callId);
+            callId = null;
+        }
+    });
+
+    function createPeerConnection(targetId) {
+        targetConnectionId = targetId;
+        peerConnection = new RTCPeerConnection(rtcConfig);
+
+        peerConnection.onicecandidate = e => {
+            if (e.candidate) {
+                connection.invoke("SendSignal", targetConnectionId, "ice", e.candidate);
+            }
+        };
+
+        peerConnection.ontrack = e => {
+            document.getElementById("remoteAudio").srcObject = e.streams[0];
+        };
+    }
+
+    function startTimer() {
+        if (timerInterval) return;
+        startTime = new Date();
+        timerInterval = setInterval(() => {
+            const diff = new Date() - startTime;
+            const minutes = Math.floor(diff / 60000);
+            const seconds = Math.floor((diff % 60000) / 1000);
+            callDuration.textContent = `مدة المكالمة: ${minutes}:${seconds < 10 ? "0" : ""}${seconds}`;
+        }, 1000);
+    }
+
+    function stopTimer() {
+        if (timerInterval) {
+            clearInterval(timerInterval);
+            timerInterval = null;
+            callDuration.textContent = "";
+        }
+    }
+</script>
+
+
+
